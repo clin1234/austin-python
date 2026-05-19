@@ -1,6 +1,5 @@
 import abc
 import asyncio
-import io
 import typing as t
 from dataclasses import dataclass
 from dataclasses import field
@@ -67,6 +66,7 @@ class MojoEvents:
     METRIC_MEMORY = 10
     STRING = 11
     STRING_REF = 12
+    STACK_REPEAT = 13
 
 
 class MojoEventHandler:
@@ -84,6 +84,7 @@ class MojoEvent:
     """MOJO event."""
 
     EVENT_ID: t.ClassVar = None
+    raw: t.ClassVar[bytes] = b""
 
     def ref(self) -> int:
         return getattr(self, fields(self)[0].name)
@@ -93,9 +94,7 @@ class MojoEvent:
         for f in fields(self):
             value = getattr(self, f.name)
             field_type = (
-                f.type.__args__[0]
-                if isinstance(f.type, t._UnionGenericAlias)
-                else f.type
+                t.get_args(f.type)[0] if t.get_origin(f.type) is t.Union else f.type
             )
             if field_type is str:
                 buffer += value.encode()
@@ -127,9 +126,11 @@ class MojoMetric(MojoEvent):
     def to_bytes(self) -> bytes:
         buffer = bytearray(
             [
-                MojoEvents.METRIC_TIME
-                if self.metric_type is MojoMetricType.TIME
-                else MojoEvents.METRIC_MEMORY
+                (
+                    MojoEvents.METRIC_TIME
+                    if self.metric_type is MojoMetricType.TIME
+                    else MojoEvents.METRIC_MEMORY
+                )
             ]
         )
         buffer += to_varint(self.value)
@@ -182,6 +183,18 @@ class MojoStack(MojoEvent):
     pid: int
     iid: int
     tid: str
+
+
+@dataclass(frozen=True, eq=True)
+class MojoStackRepeat(MojoEvent):
+    """MOJO stack repeat event.
+
+    Signals that the previous sample for this thread provides the base
+    (outermost) frames for the current sample.  The frames accumulated so
+    far in the current sample are the innermost (top) part of the call stack.
+    """
+
+    EVENT_ID = MojoEvents.STACK_REPEAT
 
 
 @dataclass(frozen=True, eq=True)
@@ -322,6 +335,11 @@ class BaseMojoStreamReader(AustinEventIterator):
         self._str_reader = str_reader()
         next(self._str_reader)
 
+        # Per-thread previous frame list for STACK_REPEAT expansion.
+        # Key: (pid, thread_name); value: list of MojoFrame accumulated by the
+        # last fully-finalised sample for that thread.
+        self._prev_frames: t.Dict[t.Tuple[int, str], t.List[MojoFrame]] = {}
+
         # Austin events
         self.metadata: t.Dict[str, str] = {}
         self.samples: t.List[AustinSample] = []
@@ -381,27 +399,60 @@ class BaseMojoStreamReader(AustinEventIterator):
                         for metric_type, metric in self._running_sample.metrics.items()
                     }
                 ),
-                frames=tuple(
-                    AustinFrame(
-                        filename=mf.filename.value,
-                        function=mf.scope.value,
-                        line=mf.line,
-                        line_end=mf.line_end,
-                        column=mf.column,
-                        column_end=mf.column_end,
+                frames=(
+                    tuple(
+                        AustinFrame(
+                            filename=mf.filename.value,
+                            function=mf.scope.value,
+                            line=mf.line,
+                            line_end=mf.line_end,
+                            column=mf.column,
+                            column_end=mf.column_end,
+                        )
+                        for mf in self._running_sample.frames
                     )
-                    for mf in self._running_sample.frames
-                )
-                if self._running_sample.frames
-                else None,
+                    if self._running_sample.frames
+                    else None
+                ),
                 gc=self._running_sample.gc,
                 idle=self._running_sample.idle,
             )
         )
 
+        # Save fully-expanded frame list for future STACK_REPEAT events from
+        # this thread.
+        self._prev_frames[(self._running_sample.pid, self._running_sample.thread)] = (
+            list(self._running_sample.frames)
+        )
+
         self._running_sample = None
 
         return sample
+
+    @staticmethod
+    def _is_native_frame(frame: MojoFrame) -> bool:
+        name = frame.filename.value
+        return not name.endswith(".py") and not (
+            name.startswith("<") and name.endswith(">")
+        )
+
+    def get_stack_repeat(self) -> MojoStackRepeat:
+        """Handle a STACK_REPEAT event.
+
+        The previous sample's frames (minus any trailing native frames that
+        belonged to the old top-of-stack above the eval frame) are prepended
+        to the frames accumulated so far.
+        """
+        assert self._running_sample is not None
+        key = (self._running_sample.pid, self._running_sample.thread)
+        prev = list(self._prev_frames.get(key, []))
+        # Strip native frames from the innermost (top) end of the previous
+        # stack — those were above the eval frame and have now been replaced
+        # by the new frames in the current sample.
+        while prev and self._is_native_frame(prev[-1]):
+            prev.pop()
+        self._running_sample.frames = prev + self._running_sample.frames
+        return MojoStackRepeat()
 
     def get_stack(self, pid: int, iid: t.Optional[int], thread: str) -> MojoStack:
         """Parse a stack."""
@@ -611,6 +662,11 @@ class MojoStreamReader(BaseMojoStreamReader):
         """Parse string reference."""
         return self.get_string_ref(self.read_int())
 
+    @handles(MojoEvents.STACK_REPEAT)
+    def parse_stack_repeat(self) -> MojoStackRepeat:
+        """Parse a stack repeat event."""
+        return self.get_stack_repeat()
+
     def parse_event(self) -> t.Optional[MojoEvent]:
         """Parse a single event."""
         try:
@@ -670,7 +726,9 @@ class MojoStreamReader(BaseMojoStreamReader):
         if self._running_sample is not None:
             yield self._finalize_sample()
 
-    def hexdump(self, start: int, end: int, highlight: t.Set[int] = set()) -> None:  # noqa: B006
+    def hexdump(
+        self, start: int, end: int, highlight: t.Set[int] = set()  # noqa: B006
+    ) -> None:
         """Print a hexdump of the MOJO file."""
         self.mojo.seek(start)
         data = self.mojo.read(end - start)
@@ -794,6 +852,11 @@ class AsyncMojoStreamReader(BaseMojoStreamReader):
         """Parse string reference."""
         return self.get_string_ref(await self.read_int())
 
+    @handles(MojoEvents.STACK_REPEAT)
+    async def parse_stack_repeat(self) -> MojoStackRepeat:
+        """Parse a stack repeat event."""
+        return self.get_stack_repeat()
+
     async def parse_event(self) -> t.Optional[MojoEvent]:
         """Parse a single event."""
         try:
@@ -855,6 +918,8 @@ class AsyncMojoStreamReader(BaseMojoStreamReader):
 
 
 class BaseMojoStreamWriter(abc.ABC):
+    """Base class for MOJO stream writers."""
+
     HEADER = b"MOJ\x03"
 
     def __init__(self, mojo: t.Any) -> None:
@@ -904,11 +969,13 @@ class BaseMojoStreamWriter(abc.ABC):
             return mojo_frame
 
     @abc.abstractmethod
-    def write(self, event: AustinEvent) -> int: ...
+    def write(self, event: AustinEvent) -> int: ...  # noqa: E704
 
 
 class MojoStreamWriter(BaseMojoStreamWriter):
-    def __init__(self, mojo: io.BytesIO):
+    """MOJO stream writer."""
+
+    def __init__(self, mojo: t.BinaryIO) -> None:
         super().__init__(mojo)
 
         mojo.write(self.HEADER)
@@ -939,7 +1006,7 @@ class MojoStreamWriter(BaseMojoStreamWriter):
             for frame in frames:
                 size += self.mojo.write(MojoFrameReference(frame).to_bytes())
 
-            if self._gc:
+            if event.gc:
                 size += self.mojo.write(bytes([MojoEvents.GC]))
 
             if self._mode == "full":
