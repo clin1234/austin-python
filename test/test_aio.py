@@ -112,7 +112,7 @@ async def test_async_memory():
             "100",
             "python",
             "-c",
-            "[i for i in range(10000000)]",
+            "[i for i in range(100000000)]",
         ]
     )
     await asyncio.wait_for(austin.wait(), 30)
