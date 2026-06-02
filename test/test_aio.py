@@ -23,6 +23,7 @@
 
 import asyncio
 import sys
+import sysconfig
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -59,9 +60,10 @@ class TestAsyncAustin(AsyncAustin):
     async def on_terminate(self):
         data = self._meta
         assert "duration" in data
-        assert "errors" in data
-        assert "sampling" in data
-        assert "saturation" in data
+        if sysconfig.get_config_var("Py_GIL_DISABLED") is False:
+            assert "errors" in data
+            assert "sampling" in data
+            assert "saturation" in data
         self._terminate = True
 
     def assert_callbacks_called(self):
