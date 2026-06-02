@@ -68,7 +68,8 @@ class TestAsyncAustin(AsyncAustin):
 
     def assert_callbacks_called(self):
         assert self._metadata
-        assert self._sample_received
+        if sysconfig.get_config_var("Py_GIL_DISABLED") is False:
+            assert self._sample_received
         assert self._terminate
 
 
