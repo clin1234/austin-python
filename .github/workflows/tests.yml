@@ -4,7 +4,13 @@ on:
   push:
     branches:
       - main
+    paths: &paths
+      - "austin/**"
+      - "test/**"
+      - "pyproject.toml"
+      - ".github/workflows/tests.yml"
   pull_request:
+    paths: *paths
 
 concurrency: 
   group: ${{ github.head_ref || github.run_id }}
@@ -16,17 +22,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15", "3.14t", "3.15t"]
 
     name: Tests with Python ${{ matrix.python-version }} on Linux
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
         with:
           path: main
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}-dev
+          python-version: ${{ matrix.python-version }}
 
       - name: Checkout Austin development branch
         uses: actions/checkout@master
@@ -47,6 +53,11 @@ jobs:
           addr2line -V
           pip install hatch
 
+      - name: Check interpreter
+        run: |
+          cd $GITHUB_WORKSPACE/main
+          hatch -e "tests.py${{ matrix.python-version }}" run python -c "import sys, sysconfig; print(sys.version); gil = not sysconfig.get_config_var('Py_GIL_DISABLED'); assert gil != '${{ matrix.python-version }}'.endswith('t'), 'GIL mismatch'; print('GIL enabled:', gil)"
+
       - name: Run tests
         timeout-minutes: 10
         run: |
@@ -59,7 +70,7 @@ jobs:
           cd $GITHUB_WORKSPACE/main
           hatch -e coverage run cov
           hatch -e coverage run codecov
-        if: matrix.python-version == '3.10'
+        if: matrix.python-version == '3.11'
         env:
           CODECOV_TOKEN: ${{secrets.CODECOV_TOKEN}}
 
@@ -68,17 +79,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15", "3.14t", "3.15t"]
 
     name: Tests with Python ${{ matrix.python-version }} on MacOS
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
         with:
           path: main
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}-dev
+          python-version: ${{ matrix.python-version }}
 
       - name: Checkout Austin development branch
         uses: actions/checkout@master
@@ -101,6 +112,11 @@ jobs:
         run: |
           pip install hatch
 
+      - name: Check interpreter
+        run: |
+          cd $GITHUB_WORKSPACE/main
+          sudo hatch -e "tests.py${{ matrix.python-version }}" run python -c "import sys, sysconfig; print(sys.version); gil = not sysconfig.get_config_var('Py_GIL_DISABLED'); assert gil != '${{ matrix.python-version }}'.endswith('t'), 'GIL mismatch'; print('GIL enabled:', gil)"
+
       - name: Run tests
         timeout-minutes: 10
         run: |
@@ -113,17 +129,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15", "3.14t", "3.15t"]
 
     name: Tests with Python ${{ matrix.python-version }} on Windows
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
         with:
           path: main
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}-dev
+          python-version: ${{ matrix.python-version }}
 
       - name: Checkout Austin development branch
         uses: actions/checkout@master
@@ -140,6 +156,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install hatch
+
+      - name: Check interpreter
+        run: |
+          cd $env:GITHUB_WORKSPACE/main
+          hatch -e "tests.py${{ matrix.python-version }}" run python -c "import sys, sysconfig; print(sys.version); gil = not sysconfig.get_config_var('Py_GIL_DISABLED'); assert gil != '${{ matrix.python-version }}'.endswith('t'), 'GIL mismatch'; print('GIL enabled:', gil)"
 
       - name: Run tests
         timeout-minutes: 10
